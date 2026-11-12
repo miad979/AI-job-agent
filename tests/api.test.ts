@@ -3,8 +3,8 @@ import assert from "node:assert/strict";
 import type { AddressInfo } from "node:net";
 import type { Server } from "node:http";
 import { createApp, openDb } from "../server/app.ts";
-import { parseTailoringJson, scoreJob, templateTailoring, tokenize } from "../server/lib.ts";
-import type { Job } from "../server/lib.ts";
+import { parseTailoringJson, scoreJob, templateTailoring, tokenize } from "../shared/lib.ts";
+import type { Job } from "../shared/lib.ts";
 
 const RESUME = `Priya Rahman\nData Scientist · 5 years experience\n\nI build machine learning models in Python and PyTorch for medical imaging, with federated learning and NLP research experience.\n\nExperience\n• Trained federated learning models on chest X-ray datasets\n• Built NLP classifiers for Bangla dialect text\n• Wrote reproducible Python evaluation pipelines`;
 const mk = (id: number, role: string, skills: string[], description: string, url = `https://example.com/${id}`): Job => ({ id, company: `Co${id}`, role, type: "Full-time", location: "Remote", salary: "n/a", skills, url, source: "test", description, posted: "today" });
@@ -147,6 +147,63 @@ describe("agent pipeline", () => {
     const md = await call("GET", "/api/reports/export", undefined, token);
     assert.match(md.text, /# Orbit SDLC report/);
     assert.match(md.text, /Submission/);
+  });
+});
+
+describe("drafts, saved jobs & account", () => {
+  let token = "";
+  before(async () => {
+    token = (await signup("drafts@example.com", "Priya Rahman")).token;
+    await call("PUT", "/api/profile", { targetRole: "Machine Learning Engineer", resumeText: RESUME }, token);
+  });
+
+  test("queueing the same job twice returns the existing draft", async () => {
+    const first = await call("POST", "/api/applications", { job: JOBS[0] }, token);
+    assert.equal(first.status, 201);
+    const again = await call("POST", "/api/applications", { job: JOBS[0] }, token);
+    assert.equal(again.status, 200);
+    assert.equal(again.json.id, first.json.id);
+  });
+  test("regenerating a draft updates the stored application", async () => {
+    const app = (await call("GET", "/api/applications", undefined, token)).json.applications[0];
+    assert.equal(app.generatedBy, "groq:test-model");
+    groqMode = "bad";
+    try {
+      const r = await call("POST", "/api/tailor", { applicationId: app.id }, token);
+      assert.equal(r.status, 200);
+      assert.equal(r.json.generatedBy, "local-template");
+      assert.equal(r.json.application.id, app.id);
+      const stored = (await call("GET", "/api/applications", undefined, token)).json.applications[0];
+      assert.equal(stored.generatedBy, "local-template");
+      assert.match(stored.coverLetter, /Priya Rahman$/);
+    } finally { groqMode = "good"; }
+    assert.equal((await call("POST", "/api/tailor", {}, token)).status, 400);
+  });
+  test("saved jobs keep their listing so they can be shown later", async () => {
+    assert.equal((await call("PUT", "/api/saved-jobs/203", { job: JOBS[2] }, token)).status, 204);
+    const saved = await call("GET", "/api/saved-jobs", undefined, token);
+    assert.deepEqual(saved.json.jobs.map((j: Job) => j.id), [203]);
+    assert.equal(saved.json.jobs[0].role, "NLP Research Scientist");
+    assert.ok(saved.json.jobs[0].match > 0);
+    assert.equal((await call("PUT", "/api/saved-jobs/not-a-number", undefined, token)).status, 400);
+    await call("DELETE", "/api/saved-jobs/203", undefined, token);
+    assert.deepEqual((await call("GET", "/api/saved-jobs", undefined, token)).json.jobs, []);
+  });
+  test("bad requests get 4xx JSON, not a 500", async () => {
+    const res = await fetch(`${base}/api/profile`, { method: "PUT", headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` }, body: "{not json" });
+    assert.equal(res.status, 400);
+    assert.ok(((await res.json()) as { error?: string }).error);
+    const missing = await call("GET", "/api/nope", undefined, token);
+    assert.equal(missing.status, 404);
+    assert.equal(missing.json.error, "Not found");
+    assert.equal((await call("PATCH", "/api/applications/999999", { status: "Rejected" }, token)).status, 404);
+  });
+  test("deleting the account needs the password and removes everything", async () => {
+    assert.equal((await call("DELETE", "/api/account", { password: "wrong-password" }, token)).status, 403);
+    assert.equal((await call("GET", "/api/auth/me", undefined, token)).status, 200);
+    assert.equal((await call("DELETE", "/api/account", { password: "correct-horse-1" }, token)).status, 204);
+    assert.equal((await call("GET", "/api/auth/me", undefined, token)).status, 401);
+    assert.equal((await call("POST", "/api/auth/login", { email: "drafts@example.com", password: "correct-horse-1" })).status, 401);
   });
 });
 
